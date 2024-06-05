@@ -1152,7 +1152,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
                 self.apply_bias and not self.gemm_bias_unfused_add,
                 self.eps,
                 is_first_microbatch,
-                self.fp8,
+                False if self.fp8 is None else self.fp8,
                 self.fp8_calibration,
                 self.fp8_meta,
                 self.fuse_wgrad_accumulation,
