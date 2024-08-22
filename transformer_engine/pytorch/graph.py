@@ -53,6 +53,8 @@ def _make_graphed_callables(
     num_warmup_iters=3,
     allow_unused_input=False,
     fp8_weight_caching=False,
+    reuse_graph_inputs=False,
+    include_weights=True,
     _order=None,
 ):
     """
@@ -70,7 +72,9 @@ def _make_graphed_callables(
     if not isinstance(callables, tuple):
         just_one_callable = True
         callables = (callables,)
-        sample_args = (sample_args,)
+        sample_args = [sample_args,]
+    if reuse_graph_inputs and isinstance(sample_args, tuple):
+        sample_args = list(sample_args)
 
     flatten_sample_args = []
     if _order is not None:
@@ -126,7 +130,7 @@ def _make_graphed_callables(
     per_callable_len_user_args = [len(args) for args in flatten_sample_args]
     if _order is None:
         per_callable_module_params = [
-            tuple(c.parameters()) if isinstance(c, torch.nn.Module) else ()
+            tuple(c.parameters()) if include_weights and isinstance(c, torch.nn.Module) else ()
             for c in callables
         ]
         per_callable_static_input_surfaces = [
@@ -138,7 +142,7 @@ def _make_graphed_callables(
         for i in range(num_microbatches):
             for c in callables:
                 per_callable_module_params.append(
-                    tuple(c.parameters()) if isinstance(c, torch.nn.Module) else ()
+                    tuple(c.parameters()) if include_weights and isinstance(c, torch.nn.Module) else ()
                 )
         assert len(per_callable_module_params) == len(flatten_sample_args)
         per_callable_static_input_surfaces = [
@@ -191,14 +195,34 @@ def _make_graphed_callables(
         per_callable_static_grad_inputs = [None] * len(flatten_sample_args)
         fwd_idx = [0] * num_model_chunks
         bwd_idx = [0] * num_model_chunks
-        for c_id in _order:
+        fwd_order_producers = {}
+        fwd_order_producers_idx = 0
+        fwd_args_recorder = []
+        static_grad_outputs = None
+        for idx, c_id in enumerate(_order):
             if c_id > 0:
+                if reuse_graph_inputs:
+                    # Record the fwd order pattern for input data reusing.
+                    if c_id in fwd_order_producers:
+                        fwd_order_producers[c_id].append(fwd_order_producers_idx)
+                    else:
+                        fwd_order_producers[c_id] = [fwd_order_producers_idx]
+                    fwd_order_producers_idx += 1
+                    if idx > 1 and _order[idx-1] < 0:
+                        fwd_order_consume = fwd_order_producers[c_id].pop(0)
+
                 # Capture forward graph for model chunk c_id, microbatch fwd_idx[c_id-1]
                 m_chunk = c_id-1
                 for l_no in range(num_layers):
                     func = callables[m_chunk*num_layers + l_no]
                     per_callable_fwd_idx = (m_chunk * num_microbatches * num_layers) \
                                         + (fwd_idx[m_chunk] * num_layers + l_no)
+                    if reuse_graph_inputs:
+                        fwd_args_recorder.append(per_callable_fwd_idx)
+                        if idx > 1 and _order[idx-1] < 0:
+                            # Can use the input data args of a previous one.
+                            sample_args[per_callable_fwd_idx] = sample_args[fwd_args_recorder[fwd_order_consume*num_layers + l_no]]
+                            per_callable_static_input_surfaces[per_callable_fwd_idx] = per_callable_static_input_surfaces[fwd_args_recorder[fwd_order_consume*num_layers + l_no]][:len(flatten_sample_args[i])] + per_callable_static_input_surfaces[per_callable_fwd_idx][len(flatten_sample_args[i]):]
                     args = sample_args[per_callable_fwd_idx]
                     fwd_graph = fwd_graphs[per_callable_fwd_idx]
                     with torch.cuda.graph(fwd_graph, pool=mempool):
@@ -218,9 +242,10 @@ def _make_graphed_callables(
                     static_outputs = per_callable_static_outputs[per_callable_bwd_idx]
                     bwd_graph = bwd_graphs[per_callable_bwd_idx]
                     # For now, assumes all static_outputs require grad
-                    static_grad_outputs = tuple(
-                        torch.empty_like(o) if o.requires_grad else None for o in static_outputs
-                    )
+                    if not reuse_graph_inputs or static_grad_outputs is None:
+                        static_grad_outputs = tuple(
+                            torch.empty_like(o) if o.requires_grad else None for o in static_outputs
+                        )
                     with torch.cuda.graph(bwd_graph, pool=mempool):
                         grad_inputs = torch.autograd.grad(
                             outputs=tuple(o for o in static_outputs if o.requires_grad),
@@ -392,14 +417,15 @@ def _make_graphed_callables(
                     # If the module's training-or-eval state matches what we graphed,
                     # run the graph, otherwise run the original forward method
                     if func.training == graph_training_state:
-                        # Set the FP8 group from global amax reduction.
-                        for m in func.modules():
-                            if (isinstance(m, TransformerEngineBaseModule)
-                                and FP8GlobalStateManager.is_fp8_enabled()):
-                                m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
-                                m.fp8_meta["recipe"] = FP8GlobalStateManager.get_fp8_recipe()
-                                FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(
-                                    m.fp8_meta, fp8_weights=m._get_fp8_params())
+                        if include_weights:
+                            # Set the FP8 group from global amax reduction.
+                            for m in func.modules():
+                                if (isinstance(m, TransformerEngineBaseModule)
+                                    and FP8GlobalStateManager.is_fp8_enabled()):
+                                    m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
+                                    m.fp8_meta["recipe"] = FP8GlobalStateManager.get_fp8_recipe()
+                                    FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(
+                                        m.fp8_meta, fp8_weights=m._get_fp8_params())
                         return graphed(*user_args, **user_kwargs)
                     return orig_fwd(*user_args, **user_kwargs)
                 return new_fwd
@@ -452,6 +478,8 @@ def make_graphed_callables(
     fp8_calibrating=False,
     fp8_recipe=None,
     fp8_weight_caching=False,
+    reuse_graph_inputs=False,
+    include_weights=True,
     _order=None,
 ):
     """
@@ -527,7 +555,10 @@ def make_graphed_callables(
     graphed_callables = _make_graphed_callables(
         forward_funcs, sample_args, num_warmup_iters=num_warmup_iters,
         allow_unused_input=allow_unused_input,
-        fp8_weight_caching=fp8_weight_caching, _order=_order)
+        fp8_weight_caching=fp8_weight_caching,
+        reuse_graph_inputs=reuse_graph_inputs,
+        include_weights=include_weights,
+        _order=_order)
 
     # Ensures warmup does not affect numerics for ops such as dropout.
     if graph_safe_rng_available():
