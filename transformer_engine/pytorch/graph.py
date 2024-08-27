@@ -54,6 +54,7 @@ def _make_graphed_callables(
     allow_unused_input=False,
     fp8_weight_caching=False,
     reuse_graph_inputs=False,
+    reuse_graph_outputs=False,
     include_weights=True,
     _order=None,
 ):
@@ -199,9 +200,11 @@ def _make_graphed_callables(
         fwd_order_producers_idx = 0
         fwd_args_recorder = []
         static_grad_outputs = None
+        static_grad_inputs = []
+        static_grad_inputs_exists = False
         for idx, c_id in enumerate(_order):
             if c_id > 0:
-                if reuse_graph_inputs:
+                if reuse_graph_inputs or reuse_graph_outputs:
                     # Record the fwd order pattern for input data reusing.
                     if c_id in fwd_order_producers:
                         fwd_order_producers[c_id].append(fwd_order_producers_idx)
@@ -217,9 +220,9 @@ def _make_graphed_callables(
                     func = callables[m_chunk*num_layers + l_no]
                     per_callable_fwd_idx = (m_chunk * num_microbatches * num_layers) \
                                         + (fwd_idx[m_chunk] * num_layers + l_no)
-                    if reuse_graph_inputs:
+                    if reuse_graph_inputs or reuse_graph_outputs:
                         fwd_args_recorder.append(per_callable_fwd_idx)
-                        if idx > 1 and _order[idx-1] < 0:
+                        if reuse_graph_inputs and idx > 1 and _order[idx-1] < 0:
                             # Can use the input data args of a previous one.
                             sample_args[per_callable_fwd_idx] = sample_args[fwd_args_recorder[fwd_order_consume*num_layers + l_no]]
                             per_callable_static_input_surfaces[per_callable_fwd_idx] = per_callable_static_input_surfaces[fwd_args_recorder[fwd_order_consume*num_layers + l_no]][:len(flatten_sample_args[i])] + per_callable_static_input_surfaces[per_callable_fwd_idx][len(flatten_sample_args[i]):]
@@ -227,8 +230,16 @@ def _make_graphed_callables(
                     fwd_graph = fwd_graphs[per_callable_fwd_idx]
                     with torch.cuda.graph(fwd_graph, pool=mempool):
                         outputs = func(*args)
-                    flatten_outputs, spec = _tree_flatten(outputs)
-                    per_callable_static_outputs[per_callable_fwd_idx] = tuple(flatten_outputs)
+                        flatten_outputs, spec = _tree_flatten(outputs)
+                        if reuse_graph_outputs and idx > 1 and _order[idx-1] < 0:
+                            # Can use the output data tensor of a previous one.
+                            static_outputs = per_callable_static_outputs[fwd_args_recorder[fwd_order_consume*num_layers + l_no]]
+                            detached_static_outputs = tuple(so.detach() for so in static_outputs)
+                            for i, static_output in enumerate(detached_static_outputs):
+                                static_output.copy_(flatten_outputs[i])
+                            per_callable_static_outputs[per_callable_fwd_idx] = detached_static_outputs
+                        else:
+                            per_callable_static_outputs[per_callable_fwd_idx] = tuple(flatten_outputs)
                     per_callable_output_unflatten_spec[per_callable_fwd_idx] = spec
                     graph_callables[per_callable_fwd_idx] = func
                 fwd_idx[m_chunk] += 1
@@ -254,21 +265,27 @@ def _make_graphed_callables(
                             only_inputs=True,
                             allow_unused=allow_unused_input,
                         )
-                    # Constructs a tuple suitable for returning from Graphed.backward:
-                    # Pads out the actually-needed grads with Nones in gradient slots for inputs
-                    # that don't require grad. I couldn't think of a one-liner for this pattern.
-                    static_grad_inputs = []
-                    grad_idx = 0
-                    for arg in static_input_surface:
-                        if arg.requires_grad:
-                            static_grad_inputs.append(grad_inputs[grad_idx])
-                            grad_idx += 1
-                        else:
-                            static_grad_inputs.append(None)  # type: ignore[arg-type]
-                    static_grad_inputs = tuple(static_grad_inputs)  # type: ignore[assignment]
+                        # Constructs a tuple suitable for returning from Graphed.backward:
+                        # Pads out the actually-needed grads with Nones in gradient slots for inputs
+                        # that don't require grad. I couldn't think of a one-liner for this pattern.
+                        if not reuse_graph_outputs:
+                            static_grad_inputs = []
+                        grad_idx = 0
+                        for input_idx, arg in enumerate(static_input_surface):
+                            if arg.requires_grad:
+                                if reuse_graph_outputs and static_grad_inputs_exists:
+                                    if static_grad_inputs[input_idx] is not None:
+                                        static_grad_inputs[input_idx].copy_(grad_inputs[grad_idx])
+                                else:
+                                    static_grad_inputs.append(grad_inputs[grad_idx])
+                                grad_idx += 1
+                            elif not reuse_graph_outputs or not static_grad_inputs_exists:
+                                static_grad_inputs.append(None)  # type: ignore[arg-type]
+                    if reuse_graph_outputs:
+                        static_grad_inputs_exists = True
 
                     per_callable_static_grad_outputs[per_callable_bwd_idx] = static_grad_outputs
-                    per_callable_static_grad_inputs[per_callable_bwd_idx] = static_grad_inputs
+                    per_callable_static_grad_inputs[per_callable_bwd_idx] = tuple(static_grad_inputs)
                 bwd_idx[m_chunk] += 1
     else:
         # Capture forward graphs
@@ -479,6 +496,7 @@ def make_graphed_callables(
     fp8_recipe=None,
     fp8_weight_caching=False,
     reuse_graph_inputs=False,
+    reuse_graph_outputs=False,
     include_weights=True,
     _order=None,
 ):
@@ -557,6 +575,7 @@ def make_graphed_callables(
         allow_unused_input=allow_unused_input,
         fp8_weight_caching=fp8_weight_caching,
         reuse_graph_inputs=reuse_graph_inputs,
+        reuse_graph_outputs=reuse_graph_outputs,
         include_weights=include_weights,
         _order=_order)
 
