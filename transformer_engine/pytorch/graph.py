@@ -196,9 +196,9 @@ def _make_graphed_callables(
         per_callable_static_grad_inputs = [None] * len(flatten_sample_args)
         fwd_idx = [0] * num_model_chunks
         bwd_idx = [0] * num_model_chunks
-        fwd_order_producers = {}
-        fwd_order_producers_idx = 0
-        fwd_args_recorder = []
+        fwd_order_recorder = {}
+        fwd_order_accu = 0
+        per_callable_fwd_idx_recorder = []
         static_grad_outputs = None
         static_grad_inputs = []
         static_grad_inputs_exists = False
@@ -206,13 +206,14 @@ def _make_graphed_callables(
             if c_id > 0:
                 if reuse_graph_inputs or reuse_graph_outputs:
                     # Record the fwd order pattern for input data reusing.
-                    if c_id in fwd_order_producers:
-                        fwd_order_producers[c_id].append(fwd_order_producers_idx)
+                    if c_id in fwd_order_recorder:
+                        fwd_order_recorder[c_id].append(fwd_order_accu)
                     else:
-                        fwd_order_producers[c_id] = [fwd_order_producers_idx]
-                    fwd_order_producers_idx += 1
+                        fwd_order_recorder[c_id] = [fwd_order_accu]
+                    fwd_order_accu += 1
                     if idx > 1 and _order[idx-1] < 0:
-                        fwd_order_consume = fwd_order_producers[c_id].pop(0)
+                        # Can use the tensor buffer of a previous one.
+                        reuse_fwd_idx = fwd_order_recorder[abs(_order[idx-1])].pop(0)
 
                 # Capture forward graph for model chunk c_id, microbatch fwd_idx[c_id-1]
                 m_chunk = c_id-1
@@ -221,20 +222,22 @@ def _make_graphed_callables(
                     per_callable_fwd_idx = (m_chunk * num_microbatches * num_layers) \
                                         + (fwd_idx[m_chunk] * num_layers + l_no)
                     if reuse_graph_inputs or reuse_graph_outputs:
-                        fwd_args_recorder.append(per_callable_fwd_idx)
-                        if reuse_graph_inputs and idx > 1 and _order[idx-1] < 0:
-                            # Can use the input data args of a previous one.
-                            sample_args[per_callable_fwd_idx] = sample_args[fwd_args_recorder[fwd_order_consume*num_layers + l_no]]
-                            per_callable_static_input_surfaces[per_callable_fwd_idx] = per_callable_static_input_surfaces[fwd_args_recorder[fwd_order_consume*num_layers + l_no]][:len(flatten_sample_args[i])] + per_callable_static_input_surfaces[per_callable_fwd_idx][len(flatten_sample_args[i]):]
+                        per_callable_fwd_idx_recorder.append(per_callable_fwd_idx)
+                        if idx > 1 and _order[idx-1] < 0:
+                            # Can use the tensor buffer of a previous one.
+                            reuse_per_callable_fwd_idx = per_callable_fwd_idx_recorder[reuse_fwd_idx*num_layers + l_no]
+                            if reuse_graph_inputs:
+                                sample_args[per_callable_fwd_idx] = sample_args[reuse_per_callable_fwd_idx]
+                                per_callable_static_input_surfaces[per_callable_fwd_idx] = per_callable_static_input_surfaces[reuse_per_callable_fwd_idx][:len(flatten_sample_args[i])] + per_callable_static_input_surfaces[per_callable_fwd_idx][len(flatten_sample_args[i]):]
+                            if reuse_graph_outputs:
+                                static_outputs = per_callable_static_outputs[reuse_per_callable_fwd_idx]
+                                detached_static_outputs = tuple(so.detach() for so in static_outputs)
                     args = sample_args[per_callable_fwd_idx]
                     fwd_graph = fwd_graphs[per_callable_fwd_idx]
                     with torch.cuda.graph(fwd_graph, pool=mempool):
                         outputs = func(*args)
                         flatten_outputs, spec = _tree_flatten(outputs)
                         if reuse_graph_outputs and idx > 1 and _order[idx-1] < 0:
-                            # Can use the output data tensor of a previous one.
-                            static_outputs = per_callable_static_outputs[fwd_args_recorder[fwd_order_consume*num_layers + l_no]]
-                            detached_static_outputs = tuple(so.detach() for so in static_outputs)
                             for i, static_output in enumerate(detached_static_outputs):
                                 static_output.copy_(flatten_outputs[i])
                             per_callable_static_outputs[per_callable_fwd_idx] = detached_static_outputs
