@@ -200,6 +200,9 @@ def _make_graphed_callables(
                     allow_unused=allow_unused_input,
                 )
             del outputs, grad_inputs
+            for module in func.modules():
+                if hasattr(module, 'is_first_microbatch'):
+                    module.is_first_microbatch = True
     torch.cuda.synchronize()
 
     # All captures here share a mempool. To avoid replays corrupting each other's memory,
