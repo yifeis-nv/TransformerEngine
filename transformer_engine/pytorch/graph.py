@@ -53,6 +53,7 @@ def _make_graphed_callables(
     num_warmup_iters=3,
     allow_unused_input=False,
     fp8_weight_caching=False,
+    fp8_meta_partially_update=False,
     reuse_graph_inputs=False,
     reuse_graph_outputs=False,
     include_weights=True,
@@ -140,11 +141,12 @@ def _make_graphed_callables(
         ]
     else:
         per_callable_module_params = []
-        for i in range(num_microbatches):
-            for c in callables:
-                per_callable_module_params.append(
-                    tuple(c.parameters()) if include_weights and isinstance(c, torch.nn.Module) else ()
-                )
+        for m_chunk in range(num_model_chunks):
+            for idx in range(num_microbatches):
+                for l_no in range(num_layers):
+                    per_callable_module_params.append(
+                        tuple(callables[m_chunk*num_layers + l_no].parameters()) if isinstance(c, torch.nn.Module) else ()
+                    )
         assert len(per_callable_module_params) == len(flatten_sample_args)
         per_callable_static_input_surfaces = [
             flatten_sample_args[i] + per_callable_module_params[i]
@@ -167,12 +169,27 @@ def _make_graphed_callables(
     # Hopefully prevents cudnn benchmarking and other lazy-initialization cuda work
     # from ending up in any captures.
     torch.cuda.synchronize()
+    if fp8_meta_partially_update:
+        assert(num_warmup_iters > 0), (
+            "Warmup iterations need to be > 0 when enable fp8_meta_partially_update"
+        )
+    visited_modules = set()
+    def hook_fn(module, input, output):
+        visited_modules.add(module)
     with torch.cuda.stream(torch.cuda.Stream()):
         for c_i, func in enumerate(callables):
             args = sample_args[c_i]
             static_input_surface = per_callable_static_input_surfaces[c_i]
             for _ in range(num_warmup_iters):
+                hooks = []
+                if fp8_meta_partially_update:
+                    for module in func.modules():
+                        hook = module.register_forward_hook(hook_fn)
+                        hooks.append(hook)
                 outputs, _ = _tree_flatten(func(*args))
+                if fp8_meta_partially_update:
+                    for hook in hooks:
+                        hook.remove()
                 grad_inputs = torch.autograd.grad(
                     outputs=tuple(o for o in outputs if o.requires_grad),
                     inputs=tuple(i for i in static_input_surface if i.requires_grad),
@@ -442,6 +459,8 @@ def _make_graphed_callables(
                             for m in func.modules():
                                 if (isinstance(m, TransformerEngineBaseModule)
                                     and FP8GlobalStateManager.is_fp8_enabled()):
+                                    if visited_modules != None and m not in visited_modules and fp8_meta_partially_update:
+                                        continue
                                     m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
                                     m.fp8_meta["recipe"] = FP8GlobalStateManager.get_fp8_recipe()
                                     FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(
@@ -497,7 +516,9 @@ def make_graphed_callables(
     fp8_enabled=False,
     fp8_calibrating=False,
     fp8_recipe=None,
+    fp8_group=None,
     fp8_weight_caching=False,
+    fp8_meta_partially_update=False,
     reuse_graph_inputs=False,
     reuse_graph_outputs=False,
     include_weights=True,
@@ -521,6 +542,9 @@ def make_graphed_callables(
                      using a higher precision.
     fp8_recipe: recipe.DelayedScaling, default = `None`
                 recipe used for FP8 training.
+    fp8_group: torch._C._distributed_c10d.ProcessGroup, default = `None`
+               distributed group over which amaxes for the fp8 tensors
+               are reduced at the end of each training step.
     fp8_weight_caching: bool, default = `False`
                         Whether or not to cache FP8 weights across microbatches. if set to `True`,
                         the `is_first_microbatch` boolean argument must be passed into the forward
@@ -528,6 +552,9 @@ def make_graphed_callables(
                         using TE's `fp8_model_init` API and using an FP8 aware optimizer, this arg
                         must be set to `False` if calculating weight transposes' outside TE, e.g.,
                         in the optimizer step.
+    fp8_meta_partially_update: bool, default = `False`
+                        Whether or not to only update FP8 Metadata for the modules included by 
+                        forward function.
     """
     set_capture_start()
 
@@ -549,6 +576,7 @@ def make_graphed_callables(
             with fp8_autocast(enabled=fp8_enabled,
                               calibrating=fp8_calibrating,
                               fp8_recipe=fp8_recipe,
+                              fp8_group=fp8_group,
                               _graph=True):
                 outputs = old_forward(*args, **kwargs)
             return outputs
@@ -577,6 +605,7 @@ def make_graphed_callables(
         forward_funcs, sample_args, num_warmup_iters=num_warmup_iters,
         allow_unused_input=allow_unused_input,
         fp8_weight_caching=fp8_weight_caching,
+        fp8_meta_partially_update=fp8_meta_partially_update,
         reuse_graph_inputs=reuse_graph_inputs,
         reuse_graph_outputs=reuse_graph_outputs,
         include_weights=include_weights,
