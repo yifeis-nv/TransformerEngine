@@ -458,12 +458,15 @@ def _make_graphed_callables(
                     # run the graph, otherwise run the original forward method
                     if func.training == graph_training_state:
                         if include_weights:
-                            for m in func.modules():
+                            for name, m in func.named_modules():
                                 if (isinstance(m, TransformerEngineBaseModule)
                                     and FP8GlobalStateManager.is_fp8_enabled()):
+                                    fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
                                     if fp8_meta_partially_update:
                                         if visited_modules != None and m not in visited_modules:
                                             # Only Set the FP8 meta for the modules included by forward 
+                                            continue
+                                        if not fp8_recipe.fp8_mha and not fp8_recipe.fp8_dpa and hasattr(m, "attention_dropout") and m.deterministic:
                                             continue
                                     # Set the FP8 group from global amax reduction.
                                     m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()

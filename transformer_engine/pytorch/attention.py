@@ -3016,6 +3016,7 @@ class FusedAttention(TransformerEngineBaseModule):
         self.use_FAv2_bwd = (os.getenv("NVTE_FUSED_ATTN_USE_FAv2_BWD", "0") == "1"
                         and get_device_compute_capability() == (9, 0))
         self.layer_number = 1 if layer_number is None else layer_number
+        self.deterministic = deterministic
         if deterministic:
             # workspace optimization path is deterministic
             os.environ["CUDNN_FRONTEND_ATTN_DP_WORKSPACE_LIMIT"] = "-1"
