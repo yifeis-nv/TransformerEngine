@@ -145,7 +145,7 @@ def _make_graphed_callables(
             for idx in range(num_microbatches):
                 for l_no in range(num_layers):
                     per_callable_module_params.append(
-                        tuple(callables[m_chunk*num_layers + l_no].parameters()) if isinstance(c, torch.nn.Module) else ()
+                        tuple(callables[m_chunk*num_layers + l_no].parameters()) if include_weights and isinstance(callables[m_chunk*num_layers + l_no], torch.nn.Module) else ()
                     )
         assert len(per_callable_module_params) == len(flatten_sample_args)
         per_callable_static_input_surfaces = [
@@ -248,7 +248,7 @@ def _make_graphed_callables(
                             reuse_per_callable_fwd_idx = per_callable_fwd_idx_recorder[reuse_fwd_idx*num_layers + l_no]
                             if reuse_graph_inputs:
                                 sample_args[per_callable_fwd_idx] = sample_args[reuse_per_callable_fwd_idx]
-                                per_callable_static_input_surfaces[per_callable_fwd_idx] = per_callable_static_input_surfaces[reuse_per_callable_fwd_idx][:len(flatten_sample_args[i])] + per_callable_static_input_surfaces[per_callable_fwd_idx][len(flatten_sample_args[i]):]
+                                per_callable_static_input_surfaces[per_callable_fwd_idx] = per_callable_static_input_surfaces[reuse_per_callable_fwd_idx][:len(flatten_sample_args[per_callable_fwd_idx])] + per_callable_static_input_surfaces[per_callable_fwd_idx][len(flatten_sample_args[per_callable_fwd_idx]):]
                             if reuse_graph_outputs:
                                 static_outputs = per_callable_static_outputs[reuse_per_callable_fwd_idx]
                                 detached_static_outputs = tuple(so.detach() for so in static_outputs)
@@ -458,12 +458,14 @@ def _make_graphed_callables(
                     # run the graph, otherwise run the original forward method
                     if func.training == graph_training_state:
                         if include_weights:
-                            # Set the FP8 group from global amax reduction.
                             for m in func.modules():
                                 if (isinstance(m, TransformerEngineBaseModule)
                                     and FP8GlobalStateManager.is_fp8_enabled()):
-                                    if visited_modules != None and m not in visited_modules and fp8_meta_partially_update:
-                                        continue
+                                    if fp8_meta_partially_update:
+                                        if visited_modules != None and m not in visited_modules:
+                                            # Only Set the FP8 meta for the modules included by forward 
+                                            continue
+                                    # Set the FP8 group from global amax reduction.
                                     m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
                                     m.fp8_meta["recipe"] = FP8GlobalStateManager.get_fp8_recipe()
                                     FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(
